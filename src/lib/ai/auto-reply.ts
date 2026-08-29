@@ -7,8 +7,12 @@ import { buildSystemPrompt } from './defaults'
 import { buildHandoffSummary } from './handoff'
 import { logAiUsage } from './usage'
 import { latestUserMessage } from './query'
-import { engineSendText } from '@/lib/flows/meta-send'
+import { engineSendMedia, engineSendText } from '@/lib/flows/meta-send'
 import { checkRateLimit, RATE_LIMITS } from '@/lib/rate-limit'
+import { hasActiveCatalogSources } from './catalog/resolver'
+import { CATALOG_TOOL_SPECS, GET_PRODUCT_MEDIA, executeCatalogTool } from './tools/catalog-tools'
+import { catalogContextToPromptText, updateCatalogContext, type CatalogTurnContext } from './catalog/context'
+import type { ToolExecutor } from './types'
 
 interface DispatchArgs {
   /** Tenancy key — drives config, contact, and whatsapp_config lookups. */
@@ -73,6 +77,25 @@ export async function dispatchInboundToAiReply(
       .eq('id', conversationId)
       .maybeSingle()
     if (convErr || !conv) return
+
+    // Best-effort, SEPARATE from the query above on purpose: migration
+    // 045 (conversations.ai_catalog_context) may not be applied yet in
+    // every environment. If the column is missing, this query errors
+    // and we simply proceed with no cross-turn context rather than
+    // failing the whole dispatch — auto-reply must keep working exactly
+    // as before this feature on an environment that hasn't migrated.
+    let previousCatalogContext: CatalogTurnContext | null = null
+    try {
+      const { data: ctxRow, error: ctxErr } = await db
+        .from('conversations')
+        .select('ai_catalog_context')
+        .eq('id', conversationId)
+        .maybeSingle()
+      if (ctxErr) throw ctxErr
+      previousCatalogContext = (ctxRow?.ai_catalog_context as CatalogTurnContext | null) ?? null
+    } catch (err) {
+      console.warn('[ai auto-reply] ai_catalog_context read failed (migration 045 applied?):', err)
+    }
     if (conv.assigned_agent_id) return // a human owns this thread
     if (conv.ai_autoreply_disabled) return // handed off / turned off here
     // Cheap early-out; the authoritative cap check is the atomic claim
@@ -106,17 +129,57 @@ export async function dispatchInboundToAiReply(
       latestUserMessage(messages),
     )
 
+    // Catalog tools (search_catalog/get_product/get_availability/
+    // get_product_media) are attached ONLY when the account has at
+    // least one active Catalog integration (Budun ERP) or catalog-usage
+    // Data Source — accounts with neither configured get the exact same
+    // request as before this feature existed. See
+    // docs/integrations/ai-data-integration/01_MASTER_EXECUTION.md.
+    const catalogAvailable = await hasActiveCatalogSources(db, accountId)
+    const tools = catalogAvailable ? CATALOG_TOOL_SPECS : undefined
+    const executeTool: ToolExecutor | undefined = catalogAvailable
+      ? wrapWithMediaSideEffect(executeCatalogTool(db, accountId), {
+          accountId,
+          userId: configOwnerUserId,
+          conversationId,
+          contactId,
+        })
+      : undefined
+
     const systemPrompt = buildSystemPrompt({
       userPrompt: config.systemPrompt,
       mode: 'auto_reply',
       knowledge,
+      catalogToolsAvailable: catalogAvailable,
+      catalogContextText: catalogContextToPromptText(previousCatalogContext),
     })
 
-    const { text, handoff, usage } = await generateReply({
+    const { text, handoff, usage, toolCalls } = await generateReply({
       config,
       systemPrompt,
       messages,
+      tools,
+      executeTool,
     })
+
+    // Fold this turn's tool results into the cross-turn catalog context
+    // (AI_Catalog_Fix_Kit FASE 5/6/9) so a later short follow-up like
+    // "¿y el morado?" can resolve the right product even though the
+    // tool-calling loop's own tool_calls are otherwise ephemeral. Only
+    // written when there's something new OR something to carry forward
+    // — and best-effort for the same reason as the read above.
+    if (catalogAvailable && (toolCalls.length > 0 || previousCatalogContext)) {
+      const nextCatalogContext = updateCatalogContext(previousCatalogContext, toolCalls)
+      try {
+        const { error } = await db
+          .from('conversations')
+          .update({ ai_catalog_context: nextCatalogContext })
+          .eq('id', conversationId)
+        if (error) throw error
+      } catch (err) {
+        console.warn('[ai auto-reply] ai_catalog_context write failed (migration 045 applied?):', err)
+      }
+    }
 
     // Record token spend on the account's BYO key. Fire-and-forget so it
     // never adds latency to the customer-facing send: `logAiUsage`
@@ -189,5 +252,50 @@ export async function dispatchInboundToAiReply(
     })
   } catch (err) {
     console.error('[ai auto-reply] dispatch failed:', err)
+  }
+}
+
+/**
+ * Wraps the generic catalog ToolExecutor so that a successful
+ * `get_product_media` call ALSO sends the resolved image over WhatsApp
+ * via the existing `engineSendMedia` — the only place in this feature
+ * that touches WhatsApp media, matching
+ * docs/integrations/ai-data-integration/01_MASTER_EXECUTION.md
+ * ("MEDIA Y WHATSAPP" — "No crear un segundo sistema de envío de
+ * media."). The Playground wiring (src/app/api/ai/playground/route.ts)
+ * intentionally does NOT use this wrapper — it calls
+ * `executeCatalogTool` directly, so testing the agent never messages a
+ * real customer.
+ *
+ * Best-effort: a failed send (e.g. WhatsApp not configured, Meta
+ * rejects the link) is logged and swallowed — the tool result the model
+ * sees is unaffected, so the text reply still goes out even if the
+ * photo attempt failed.
+ */
+export function wrapWithMediaSideEffect(
+  base: ToolExecutor,
+  target: { accountId: string; userId: string; conversationId: string; contactId: string },
+): ToolExecutor {
+  return async (call) => {
+    const result = await base(call)
+    if (call.name !== GET_PRODUCT_MEDIA || !result || typeof result !== 'object' || 'error' in result) {
+      return result
+    }
+    const media = result as { primaryImage?: { url: string } | null; images?: { url: string }[] }
+    const url = media.primaryImage?.url ?? media.images?.[0]?.url
+    if (!url) return result
+    try {
+      await engineSendMedia({
+        accountId: target.accountId,
+        userId: target.userId,
+        conversationId: target.conversationId,
+        contactId: target.contactId,
+        kind: 'image',
+        link: url,
+      })
+    } catch (err) {
+      console.error('[ai auto-reply] failed to send catalog product photo:', err instanceof Error ? err.message : err)
+    }
+    return result
   }
 }

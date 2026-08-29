@@ -86,23 +86,23 @@ export async function retrieveKnowledge(
   accountId: string,
   config: Pick<AiConfig, 'embeddingsApiKey'>,
   queryText: string,
-  k = 5,
+  k = 15,
 ): Promise<string[]> {
   const query = queryText.trim()
   if (!query || k <= 0) return []
 
-  // Skip everything when the account has no knowledge base — otherwise
-  // every draft / auto-reply would pay for a query embedding + two RPCs
-  // just to get []. One cheap indexed COUNT (head, no rows) instead of a
-  // paid embeddings call on the hot path.
+  // Avoid embedding/RPC work when the account has no knowledge chunks.
   try {
     const { count, error } = await db
       .from('ai_knowledge_chunks')
       .select('id', { count: 'exact', head: true })
       .eq('account_id', accountId)
-    if (error || !count) return []
-  } catch {
-    return []
+
+    if (!error && (count ?? 0) === 0) {
+      return []
+    }
+  } catch (err) {
+    console.error('[ai knowledge] failed to check KB size:', err)
   }
 
   const picked = new Map<string, string>() // id → content, preserves order
@@ -145,5 +145,11 @@ export async function retrieveKnowledge(
     }
   }
 
-  return Array.from(picked.values()).slice(0, k)
+  const results = Array.from(picked.values()).slice(0, k)
+  if (results.length === 0) {
+    console.log(
+      `[ai knowledge] no chunks found for query "${query.slice(0, 80)}" (account ${accountId.slice(0, 8)}…)`,
+    )
+  }
+  return results
 }
